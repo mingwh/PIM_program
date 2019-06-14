@@ -1,0 +1,302 @@
+int PerciseSeepage::newStep(double deltaT)
+{
+	if (beta == 0 || gamma == 0)  {
+		opserr << "PerciseSeepage::newStep() - error in variable\n";
+		opserr << "gamma = " << gamma << " beta = " << beta << endln;
+		return -1;
+	}
+
+	if (deltaT <= 0.0)  {
+		opserr << "PerciseSeepage::newStep() - error in variable\n";
+		opserr << "dT = " << deltaT << endln;
+		return -2;	
+	}
+
+	// get a pointer to the AnalysisModel
+	AnalysisModel *theModel = this->getAnalysisModel();
+
+	/*countForStart = 0;*/
+	countForStep = 0;
+
+	delta = deltaT;
+
+	Udot->Zero();
+	theModel->setVel(*Udot);
+	//theModel->setResponse(*U,*Udot,*Udotdot);
+
+	// set the constants
+	if (displ == true)  {
+		c1 = 1.0;
+		c2 = gamma/(beta*deltaT);
+		c3 = 1.0/(beta*deltaT*deltaT);
+	} 
+
+	if (U == 0)  {
+		opserr << "PerciseSeepage::newStep() - domainChange() failed or hasn't been called\n";
+		return -3;	
+	}
+
+	//opserr<<(*U);
+	// increment the time to t+deltaT and apply the load
+	double time = theModel->getCurrentDomainTime();
+	time += deltaT;
+	if (theModel->updateDomain(time, deltaT) < 0)  {
+		opserr << "PerciseSeepage::newStep() - failed to update the domain\n";
+		return -4;
+	}
+
+	return 0;
+}
+
+void
+PerciseSeepage::perciseCaculate() //caleb
+{
+	int result = 0;
+
+	LinearSOE *theLinSOE = this->getLinearSOE(); //从基类中获取求解器
+	AnalysisModel *theModel = this->getAnalysisModel();//从基类中获取分析模型
+	if (theLinSOE == 0 || theModel == 0) {
+		opserr << "WARNING TransientIntegrator::formTangent() ";
+		opserr << "no LinearSOE or AnalysisModel has been set\n";
+		//return -1;
+	}
+
+	Vector b = theLinSOE->getB();
+	int XSize = b.Size(); //总行数
+	int tangentSize = 0; //刚度矩阵的行数
+	int seepageSize ;//渗流矩阵的行数
+	// loop through the FE_Elements getting them to add the tangent   
+
+	FE_EleIter &theEles2 = theModel->getFEs();    
+	FE_Element *elePtr;    
+	DOF_GrpIter &theDOFs = theModel->getDOFs();
+	DOF_Group *dofPtr;
+
+	while ((dofPtr = theDOFs()) != 0) { 
+		ID id = dofPtr->getID();
+		if (id != 0){
+			int idSize = id.Size();
+			for (int i = 0;i < idSize;i= i + 3){   //区分出刚度矩阵、渗流矩阵和耦合矩阵
+				if (id(i) < XSize && id(i)>= 0){
+					tangentSize ++;
+				}
+				if (id(i+1) < XSize && id(i+1)>= 0){
+					tangentSize ++;  //位移的自由度个数
+				}
+				//opserr<<tangentSize<<" ";
+			}
+
+		}
+	}
+
+	seepageSize = XSize - tangentSize; //求渗流矩阵的大小
+	theEles2.reset();//重置
+	theDOFs.reset();//重置
+	ID *idForTangent = new ID(tangentSize);  //刚度矩阵的ID，对应的是总刚中的编号
+	ID *idForSeepage = new ID(seepageSize);
+	
+
+	int coutForTangent= 0,coutForSeepage = 0;
+
+	while((dofPtr = theDOFs()) != 0){
+		ID id = dofPtr->getID();
+		if (id != 0){
+			int idSize = id.Size();
+			for (int i = 0;i < idSize;i= i + 3){   //区分出刚度矩阵、渗流矩阵和耦合矩阵
+				if (id(i) < XSize && id(i)>= 0){
+					(*idForTangent)(coutForTangent) = id(i);
+					coutForTangent++;
+				}
+				if (id(i+1) < XSize && id(i+1)>= 0){
+					(*idForTangent)(coutForTangent) = id(i+1);
+					coutForTangent++;
+				}
+				if (id(i+2) < XSize && id(i+2)>= 0){
+					(*idForSeepage)(coutForSeepage) = id(i+2);
+					coutForSeepage++;
+				}
+			}
+		}				
+	}
+
+	Matrix *tangentMatrix = new Matrix(tangentSize, tangentSize);//刚度矩阵
+	Matrix *seepageMatrix = new Matrix(seepageSize, seepageSize);//渗流矩阵
+	Matrix *couplingUpMatrix = new Matrix(tangentSize,seepageSize);//耦合矩阵上 行，列
+	Matrix *couplingDownMatrix = new Matrix(seepageSize,tangentSize);//耦合矩阵下 行，列
+
+	double *tangentTotal = theLinSOE->getA(); //获取了矩阵A
+	Matrix *tangentTotalMatrix = new Matrix(XSize,XSize);
+	double *tangentTotalLoacal = new double[XSize*XSize];//防止删掉theLineSOE里面的A
+	for (int i = 0;i < XSize*XSize;i++){
+		tangentTotalLoacal[i] = tangentTotal[i];		
+	}
+	tangentTotalMatrix->setData(tangentTotalLoacal,XSize,XSize);  //总刚度矩阵
+
+	double *r = new double[idForTangent->Size()];
+	double *x = new double[idForTangent->Size()];
+	Vector B = theLinSOE->getB();  //获取不平衡力
+	opserr<<B;
+	Vector *XX = new Vector(XSize);  //位移以及孔隙水压力
+	XX->addVector(0.0,*U,1.0);
+	for (int i = 0;i < idForTangent->Size();i++){  //获取与力有关的项
+		r[i] = B[(*idForTangent)(i)] / delta;  //获取外部不平衡力,除以时步，得到速率
+		
+	}
+	for (int i = 0;i< idForSeepage->Size();i++){
+		x[i] = (*XX)[(*idForSeepage)(i)];//获取上一时步的状态(孔压)
+	}
+
+	Vector *rr = new Vector(r,idForTangent->Size());
+	Vector *X = new Vector(x,idForSeepage->Size());//用于装载X,上一步中的位移
+
+	*tangentMatrix = (*tangentTotalMatrix)(*idForTangent,*idForTangent);
+	*couplingUpMatrix = (*tangentTotalMatrix)(*idForTangent,*idForSeepage);  //设置个矩阵的大小
+	*couplingDownMatrix = (*tangentTotalMatrix)(*idForSeepage,*idForTangent);
+	*seepageMatrix = (*tangentTotalMatrix)(*idForSeepage,*idForSeepage);
+
+	Matrix *A = new Matrix(idForSeepage->Size(),idForSeepage->Size());  //先求孔压，精细积分
+
+    tangentMatrix->Invert(*tangentMatrix); //刚度矩阵变成了求逆的矩阵
+	(*A) = (*couplingDownMatrix)*(*tangentMatrix);
+	(*A) = (*A)*(*couplingUpMatrix);
+	A->Invert(*A);
+
+    Vector *R = new Vector(idForSeepage->Size());
+	(*R) = (*tangentMatrix)*(*rr);
+	(*R) = (*couplingDownMatrix)*(*R);
+	(*R) = (*A)*(*R);//R获取成功
+
+	(*A) = (*A)*(*seepageMatrix);  //矩阵A获取成功
+
+	int N = 20,stepT = 20,Time = 1200;///////////////////////////stepT就是前面的delta
+	double detalT = delta/(pow(2.0,N)) ;
+
+	Matrix *T = new Matrix(idForSeepage->Size(),idForSeepage->Size());
+	T = caculateT(*A,detalT,N); //计算系数矩阵
+	if (countForStart == 0 & countForStep == 0)
+	{
+		R = caculateR(*A,T,*R);//rrr01 ;这里A发生了变化;第一步作为启动项必须计算R
+	}
+
+	if(countForStep > 0)
+	{
+		R = caculateR(*A,T,*R);//rrr01 ;这里A发生了变化
+	}
+
+	if (countForStart == 0){//孔隙水压力用R表示,对于瞬时加载，第一步才加rrr01，作为启动步
+		R->addMatrixVector(1.0,*T,*X,1.0);  //uh = TT0*uh + rrr01;   X表示的上一时刻的uh，这里求得了孔压
+		countForStart ++;   //瞬时加载的情况
+		//opserr<<(*R);
+	}
+	else{
+	      if(countForStep == 0){
+		        R->addMatrixVector(0.0,*T,*X,1.0);
+	       }
+	      else{
+		        R->addMatrixVector(1.0,*T,*X,0.0);
+	       }
+	}
+
+	countForStep ++;
+
+	Vector *stressForPore = new Vector(seepageMatrix->noRows());  //P = inv(Kc)*(Rm-Km*U)
+
+	 rr->addMatrixVector(delta,*couplingUpMatrix,*R,-1); //公式为：u = (inv(Kmm))*(Rmm-Kcc*P);
+	 (*stressForPore) = (*tangentMatrix)*(*rr); //rr表示的是位移变量
+
+	double *xx = new double[XSize];
+	for (int j = 0;j<XSize;j++)	{
+		xx[j] = 0.0;
+	}	
+	for (int i = 0;i < idForSeepage->Size();i++){  //获取与孔压有关的项
+		xx[(*idForSeepage)(i)] = (*R)(i);
+	}
+	for (int i = 0;i<idForTangent->Size();i++){
+		xx[(*idForTangent)(i)] = (*stressForPore)(i);//获取与位移有关的项
+	}
+
+		for (int i = 0; i <XSize;i++){
+			theLinSOE->setX(i,xx[i]);
+		}
+
+	delete tangentMatrix;
+	delete tangentTotalMatrix;
+	
+	delete seepageMatrix;
+	delete couplingUpMatrix;
+	delete couplingDownMatrix;
+	tangentTotalMatrix = NULL;
+	seepageMatrix = NULL;
+	couplingDownMatrix = NULL;
+	couplingUpMatrix = NULL;*/
+	delete T;delete R;delete A;delete X;
+	
+	delete rr;
+	delete XX;
+	delete [] xx;
+	delete stressForPore;
+	delete idForSeepage;
+	delete idForTangent; //销毁ID
+	delete [] x;
+	delete [] r;	
+	delete [] tangentTotalLoacal;
+}
+
+Matrix *
+PerciseSeepage::caculateT(Matrix &A,double deltaT,int N)
+{
+	Matrix *a = new Matrix(A);
+	*a = (*a)*(deltaT);
+	Matrix *T = new Matrix(*a);
+	Matrix *aa = new Matrix(*a);
+	aa->addMatrixProduct(1.0,*aa,*a,0.5);
+	T->addMatrix(0.0,*aa,1.0);
+	*aa = (*a)*(*a);
+	T->addMatrixProduct(1.0,*a,*aa,1/6);
+	Matrix *E = new Matrix(A.noRows(),A.noCols());
+	double *e = new double[(A.noCols())*(A.noRows())];
+	for(int j = 0;j<(T->noCols())*(T->noRows());j++){
+		e[j] = 0.0;
+	}
+	for(int i = 0;i < T->noRows();i++){
+		e[(T->noRows())*i+i] = 1.0;
+	}
+	//T->Output(opserr);
+	E->setData(e,T->noRows(),T->noCols());//单位矩阵
+	//E->Output(opserr);
+	for(int j = 0;j < N;j++){
+		*a = (*T)*(2.0);
+		*aa = (*T)*(*T);
+		a->addMatrix(1.0,*aa,1.0);
+		T->addMatrix(0.0,*a,1.0);
+		//T->Output(opserr);
+	}
+	T->addMatrix(1.0,*E,1.0);
+	delete a;
+	delete aa;
+	delete e;
+	delete E;
+	return T;   //系数矩阵到此，成功形成
+}
+
+//计算R
+Vector *
+PerciseSeepage::caculateR(Matrix &A,Matrix *T,Vector &R)
+{
+	A.Invert(A);
+	R = A*(R);
+	Matrix *E = new Matrix(A.noRows(),A.noCols());
+	double *e = new double[(A.noCols())*(A.noRows())];
+	for(int j = 0;j<(T->noCols())*(T->noRows());j++){
+		e[j] = 0.0;
+	}
+	for(int i = 0;i < T->noRows();i++){
+		e[(T->noRows())*i+i] = -1.0;
+	}
+	E->setData(e,T->noRows(),T->noCols());//单位矩阵
+	Vector *temp = new Vector(T->noCols());
+	temp->addVector(0.0,((*T)+(*E))*(R),1.0);
+	delete E;
+	delete [] e;
+	return temp;
+}
